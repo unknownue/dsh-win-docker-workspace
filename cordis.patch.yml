@@ -1,0 +1,8 @@
+# dsh-win-docker-workspace bundle patch: inserts the host row into the profile's
+# plugin roster. The browser half rides the package's `dsh.client` manifest (the
+# client registry serves lib/client.js), and the host row materializes the
+# `win-docker-<mode>` agent presets on boot. Install with
+# `dsh plugin --profile <name> add <path-or-git-url>`.
+- insert:
+    - id: win-docker-workspace
+      name: 'dsh-win-docker-workspace'
