@@ -112,23 +112,17 @@ export async function check(container: string, path: string): Promise<DockerPath
 }
 
 /**
- * Store the container/shell facts of one Docker workspace.
+ * Store the container/shell facts of one Docker workspace and return the host
+ * anchor directory to register as the DSH workspace path. Each (container,
+ * container path) pair gets its own anchor, so two containers presenting the
+ * same in-container path stay fully independent.
  * @param path - the workspace root container path.
  * @param container - the container name.
  * @param shell - optional shell; empty string clears the stored value.
+ * @returns the anchor host path for `workspaces.create`.
  */
-export async function setWorkspace(path: string, container: string, shell: string): Promise<void> {
-  return call<void>('setWorkspace', { path, container, shell })
-}
-
-/**
- * Ensure the container path exists as a host directory (a realpath anchor so
- * the DSH workspace service accepts it); the filesystem provider then lists it
- * through the container instead of the host placeholder.
- * @param path - the container workspace root path.
- */
-export async function ensurePath(path: string): Promise<void> {
-  return call<void>('ensurePath', { path })
+export async function setWorkspace(path: string, container: string, shell: string): Promise<{ anchor: string }> {
+  return call<{ anchor: string }>('setWorkspace', { path, container, shell })
 }
 
 /**

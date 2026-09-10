@@ -4,7 +4,7 @@
  * handle would pin the store identity across plugin reloads. `apply` creates
  * ONE handle and passes it to both registrations.
  */
-import { defineStore, type EngineStoreHandle } from '@deepseek-ai/dsh-client-runtime/client'
+import { defineStore, type EngineStoreHandle } from '@deepseek-ai/dsh-client-store'
 
 /** Dialog-open state shared between the trigger button and the overlay dialog. */
 type DockerWorkspaceState = {

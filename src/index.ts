@@ -29,7 +29,7 @@ import { dirname, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { checkContainerPathSync, inspectMountsSync, listContainerDirSync, listContainers } from './shared/docker.ts'
-import { getWorkspace, listWorkspaces, setWorkspace } from './shared/win-docker-workspaces.ts'
+import { containerPathOf, getWorkspace, listWorkspaces, resolveAnchorPath, setWorkspace } from './shared/win-docker-workspaces.ts'
 import {
   containsMount,
   isWindowsDrivePath,
@@ -264,13 +264,8 @@ async function dispatch(method: string, params: Record<string, unknown>): Promis
       const path = requireContainerPath(params.path)
       const container = requireContainer(params.container)
       const shell = params.shell === undefined || params.shell === '' ? undefined : requireShell(params.shell)
-      setWorkspace(path, container, shell)
-      return null
-    }
-    case 'ensurePath': {
-      const path = requireContainerPath(params.path)
-      mkdirSync(path, { recursive: true })
-      return null
+      const anchor = setWorkspace(path, container, shell)
+      return { anchor }
     }
     case 'listWorkspaces': {
       return listWorkspaces()
@@ -389,6 +384,9 @@ export function apply(ctx: Context, config: Config): void {
         DSH_DOCKER_CONTAINER: {
           description: 'The Docker container of the calling session workspace, when the session cwd is a Docker workspace path.',
         },
+        DSH_DOCKER_WORKSPACE: {
+          description: 'The in-container workspace root of the calling session (e.g. C:\\workspace), when the session cwd is a Docker workspace path.',
+        },
         DSH_DOCKER_SHELL: {
           description: 'The in-container shell of the calling session workspace, when the workspace has one configured.',
         },
@@ -396,11 +394,27 @@ export function apply(ctx: Context, config: Config): void {
       resolve(execution) {
         const cwd = execution.agent?.session.header.cwd
         if (cwd === undefined) return {}
+        // The session cwd is the workspace's host anchor (new workspaces) or
+        // the container path itself (legacy workspaces): resolve through the
+        // anchor first so two containers sharing one container path still get
+        // their own container fact per session.
+        const anchor = resolveAnchorPath(cwd)
+        if (anchor !== undefined) {
+          const entry = anchor.entry
+          return {
+            DSH_DOCKER_CONTAINER: entry.container,
+            DSH_DOCKER_WORKSPACE: containerPathOf(entry, anchor.anchor),
+            ...entry.shell === undefined || entry.shell === '' ? {} : { DSH_DOCKER_SHELL: entry.shell },
+          }
+        }
         const entry = getWorkspace(cwd)
         if (entry === undefined) return {}
-        return entry.shell === undefined || entry.shell === ''
-          ? { DSH_DOCKER_CONTAINER: entry.container }
-          : { DSH_DOCKER_CONTAINER: entry.container, DSH_DOCKER_SHELL: entry.shell }
+        return {
+          DSH_DOCKER_CONTAINER: entry.container,
+          // Legacy workspace: the cwd IS the container workspace root.
+          DSH_DOCKER_WORKSPACE: normalizeWindowsPath(cwd),
+          ...entry.shell === undefined || entry.shell === '' ? {} : { DSH_DOCKER_SHELL: entry.shell },
+        }
       },
     }), 'dsh-win-docker-workspace: per-session container env fact')
   }

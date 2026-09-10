@@ -23,7 +23,7 @@ import { FsError, FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs'
 import type { FsDirEntry, FsInfo, FsPathInfo, FsTarget } from '@deepseek-ai/dsh-fs'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
 import { checkContainerPathSync, inspectMountsSync, listContainerDirSync } from './shared/docker.ts'
-import { getWorkspace, listWorkspaces } from './shared/win-docker-workspaces.ts'
+import { containerOwners, containerPathOf, getWorkspace, listRecords, resolveAnchorPath } from './shared/win-docker-workspaces.ts'
 import {
   containerChildPath,
   isWindowsDrivePath,
@@ -74,6 +74,16 @@ export class DockerFileSystem extends LocalFileSystem {
 
   private readonly container: string | undefined
 
+  /**
+   * Host targetKey → container, recorded at `resolve` time. The container is
+   * per-session (each session runs its own `fs-docker` instance) and the host
+   * key is unique within a session, so `listDir` can look the owning container
+   * back up to union the bind mounts the container overlays on a mount source
+   * (e.g. `code`/`assets` nested under the `C:\workspace` root mount) that the
+   * host source alone does not contain.
+   */
+  private readonly containerByKey = new Map<string, string>()
+
   constructor(ctx: Context, config: Config) {
     super(ctx, config)
     this.container = config.container
@@ -82,19 +92,80 @@ export class DockerFileSystem extends LocalFileSystem {
   /** Every container name this backend knows: the store's workspaces plus config. */
   private containerNames(): string[] {
     const names = new Set<string>()
-    for (const key of listWorkspaces()) {
-      const entry = getWorkspace(key)
-      if (entry !== undefined) names.add(entry.container)
-    }
+    for (const record of listRecords()) names.add(record.entry.container)
     if (this.container !== undefined && this.container !== '') names.add(this.container)
     return [...names]
   }
 
-  /** The container a container path belongs to: store first, then config. */
-  private containerFor(path: string): string {
-    const entry = getWorkspace(path)
-    if (entry !== undefined) return entry.container
-    if (this.container !== undefined && this.container !== '') return this.container
+  /** Join a normalized container root with a relative remainder ('' keeps the root). */
+  private static joinContainer(root: string, remainder: string): string {
+    return remainder === '' ? normalizeWindowsPath(root) : normalizeWindowsPath(`${normalizeWindowsPath(root)}\\${remainder}`)
+  }
+
+  /**
+   * Resolve a model/plugin path into an absolute container path plus its
+   * container. Workspace identity is the host anchor the session cwd carries:
+   * a relative path resolves against the anchor's container root, and an
+   * absolute path resolves in the SAME container as the session — so two
+   * containers that present the same container path (`C:\workspace`) each
+   * serve their own sessions. Anchor spellings passed verbatim are translated
+   * back to container paths. Without a session cwd, an absolute container path
+   * resolves only when a unique stored workspace covers it; a shared path
+   * fails loud instead of guessing a container.
+   */
+  private resolveContainerPath(path: string, cwd?: string): { container: string; containerPath: string } {
+    const anchorOfCwd = cwd !== undefined ? resolveAnchorPath(cwd) : undefined
+    if (anchorOfCwd !== undefined) {
+      const root = containerPathOf(anchorOfCwd.entry, anchorOfCwd.anchor)
+      if (!isWindowsDrivePath(path)) {
+        return { container: anchorOfCwd.entry.container, containerPath: DockerFileSystem.joinContainer(root, path) }
+      }
+      // Absolute: an anchor spelling translates to the container path; any
+      // other Windows drive path keeps its spelling in the session's container.
+      const anchorOfPath = resolveAnchorPath(path)
+      if (anchorOfPath !== undefined) {
+        const pathRoot = containerPathOf(anchorOfPath.entry, anchorOfPath.anchor)
+        return {
+          container: anchorOfPath.entry.container,
+          containerPath: DockerFileSystem.joinContainer(pathRoot, anchorOfPath.remainder),
+        }
+      }
+      return { container: anchorOfCwd.entry.container, containerPath: normalizeWindowsPath(path) }
+    }
+    if (isWindowsDrivePath(path)) {
+      const anchorOfPath = resolveAnchorPath(path)
+      if (anchorOfPath !== undefined) {
+        const pathRoot = containerPathOf(anchorOfPath.entry, anchorOfPath.anchor)
+        return {
+          container: anchorOfPath.entry.container,
+          containerPath: DockerFileSystem.joinContainer(pathRoot, anchorOfPath.remainder),
+        }
+      }
+      const entry = getWorkspace(path)
+      if (entry !== undefined) return { container: entry.container, containerPath: normalizeWindowsPath(path) }
+      if (this.container !== undefined && this.container !== '') {
+        return { container: this.container, containerPath: normalizeWindowsPath(path) }
+      }
+      const owners = containerOwners(path)
+      const detail = owners.length > 1
+        ? `; it is shared by containers ${owners.map(owner => owner.entry.container).join(', ')} — add each workspace again through the Docker workspace dialog so every container gets its own workspace`
+        : ''
+      throw new FsError(`docker-fs: container path "${path}" carries no container${detail} and none is configured`, 'FS_IO_ERROR')
+    }
+    // Relative without a session anchor: resolve against the configured base.
+    const base = this.config.cwd
+    if (base === undefined || base === '' || !isWindowsDrivePath(base)) {
+      throw new FsError('docker-fs: relative path needs a container-path cwd or configured base', 'FS_IO_ERROR')
+    }
+    const anchorOfBase = resolveAnchorPath(base)
+    if (anchorOfBase !== undefined) {
+      const root = containerPathOf(anchorOfBase.entry, anchorOfBase.anchor)
+      return { container: anchorOfBase.entry.container, containerPath: DockerFileSystem.joinContainer(root, path) }
+    }
+    const combined = normalizeWindowsPath(`${normalizeWindowsPath(base)}\\${path}`)
+    const entry = getWorkspace(base)
+    if (entry !== undefined) return { container: entry.container, containerPath: combined }
+    if (this.container !== undefined && this.container !== '') return { container: this.container, containerPath: combined }
     throw new FsError('docker-fs: container path carries no container and none is configured', 'FS_IO_ERROR')
   }
 
@@ -115,20 +186,6 @@ export class DockerFileSystem extends LocalFileSystem {
     return this.hostToContainer(key)
   }
 
-  /** Resolve a model/plugin path into an absolute container path plus its container. */
-  private resolveContainerPath(path: string, cwd?: string): { container: string; containerPath: string } {
-    if (isWindowsDrivePath(path)) {
-      return { container: this.containerFor(path), containerPath: normalizeWindowsPath(path) }
-    }
-    // Relative: resolve against the caller cwd (or the configured base), a container path.
-    const base = cwd ?? this.config.cwd
-    if (base === undefined || base === '' || !isWindowsDrivePath(base)) {
-      throw new FsError('docker-fs: relative path needs a container-path cwd or configured base', 'FS_IO_ERROR')
-    }
-    const combined = normalizeWindowsPath(`${normalizeWindowsPath(base)}\\${path}`)
-    return { container: this.containerFor(base), containerPath: combined }
-  }
-
   override async resolve(path: string, opts?: { cwd?: string; signal?: AbortSignal }): Promise<FsTarget> {
     if (opts?.signal?.aborted) throw new FsError('resolve aborted', 'FS_ABORTED')
     const { container, containerPath } = this.resolveContainerPath(path, opts?.cwd)
@@ -138,6 +195,7 @@ export class DockerFileSystem extends LocalFileSystem {
         cwd: process.cwd(),
         ...opts?.signal !== undefined ? { signal: opts.signal } : {},
       })
+      this.containerByKey.set(String(local.targetKey), container)
       const display = this.hostToContainer(String(local.displayPath)) ?? containerPath
       return { targetKey: local.targetKey, displayPath: display }
     }
@@ -196,7 +254,11 @@ export class DockerFileSystem extends LocalFileSystem {
 
   override async listDir(target: FsTarget, signal?: AbortSignal): Promise<FsDirEntry[]> {
     const parsed = parseSyntheticKey(String(target.targetKey))
-    if (parsed === null) return super.listDir(target, signal)
+    if (parsed === null) {
+      const entries = await super.listDir(target, signal)
+      const container = this.containerByKey.get(String(target.targetKey))
+      return container === undefined ? entries : this.unionMountOverlay(container, target, entries, signal)
+    }
     const entries = listContainerDirSync(parsed.container, parsed.path)
     const result: FsDirEntry[] = []
     for (const entry of entries) {
@@ -209,6 +271,52 @@ export class DockerFileSystem extends LocalFileSystem {
       })
     }
     return result
+  }
+
+  /**
+   * Union a container's bind mounts into a host-backed directory listing. The
+   * container overlays every nested mount on top of its parent mount's content
+   * (e.g. `C:\workspace\code` and `C:\workspace\assets\art_res_*` on top of the
+   * `C:\workspace` → docker-shared root mount), but the host source contains
+   * none of them — so without this, listing `C:\workspace` shows only the root
+   * mount's files and the model/UI never see the source code. Each nested
+   * mount appears as a directory entry (its deepest host source resolves
+   * directly, bypassing the shared-path container ambiguity); descending into
+   * it then repeats this union at the next level.
+   * @param container - the owning container (from `containerByKey`).
+   * @param target - the host-backed target being listed.
+   * @param entries - the mount source's own listing.
+   * @param signal - optional cancellation.
+   * @returns the union listing, sorted directories-first by name.
+   */
+  private async unionMountOverlay(container: string, target: FsTarget, entries: FsDirEntry[], signal?: AbortSignal): Promise<FsDirEntry[]> {
+    const mounts = inspectMountsSync(container)
+    const containerPath = mapHostToContainer(String(target.targetKey), mounts)
+    if (containerPath === null) return entries
+    const containerKey = normalizeWindowsPath(containerPath).toLowerCase()
+    for (const mount of mounts) {
+      const dest = normalizeWindowsPath(mount.destination)
+      const destKey = dest.toLowerCase()
+      if (destKey === containerKey || !destKey.startsWith(`${containerKey}\\`)) continue
+      const top = dest.slice(containerPath.length).replace(/^\\/, '').split('\\')[0]!
+      if (top === '' || entries.some(entry => entry.name.toLowerCase() === top.toLowerCase())) continue
+      const hostChild = mapContainerToHost(dest, mounts)
+      if (hostChild === null) continue
+      const local = await super.resolve(hostChild, {
+        cwd: process.cwd(),
+        ...signal !== undefined ? { signal } : {},
+      })
+      this.containerByKey.set(String(local.targetKey), container)
+      entries.push({ name: top, type: 'directory', target: { targetKey: local.targetKey, displayPath: dest } })
+    }
+    return entries.sort((a, b) => {
+      const aDir = a.type === 'directory' ? 0 : 1
+      const bDir = b.type === 'directory' ? 0 : 1
+      if (aDir !== bDir) return aDir - bDir
+      const an = a.name.toLowerCase()
+      const bn = b.name.toLowerCase()
+      return an < bn ? -1 : an > bn ? 1 : 0
+    })
   }
 }
 

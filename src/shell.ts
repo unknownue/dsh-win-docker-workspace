@@ -36,7 +36,7 @@ import type {
 } from '@deepseek-ai/dsh-subprocess'
 import { clampTimeout, deadline, MAX_TIMER_DELAY_MS, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import { isWindowsDrivePath, normalizeWindowsPath } from './shared/paths.ts'
-import { getWorkspace } from './shared/win-docker-workspaces.ts'
+import { containerOwners, containerPathOf, getWorkspace, resolveAnchorPath } from './shared/win-docker-workspaces.ts'
 
 /**
  * UTF-8 output pinning prepended to every command (same as `dsh-pwsh-local`):
@@ -199,25 +199,44 @@ export class DockerShellExecutor extends ShellExecutor {
   }
 
   /**
-   * Resolve the container for a workdir that carries none. The chain: the
-   * calling session's container (`DSH_DOCKER_CONTAINER`, contributed by the
-   * host half from the session's workspace), then the store entry covering the
-   * workdir, then the configured `container`. Fails loud when every source is
-   * absent rather than guessing a container the path does not belong to.
+   * Resolve the container AND the in-container working directory for a workdir.
+   * The chain:
+   * 1. a workdir under a workspace anchor (the session cwd is the workspace's
+   *    host anchor) resolves to that workspace's container and translates to
+   *    the container path — this is what keeps two containers that present the
+   *    SAME container path fully independent;
+   * 2. a container-path workdir uses the calling session's container
+   *    (`DSH_DOCKER_CONTAINER`, contributed by the host half from the session's
+   *    workspace), then the unique store entry covering the path;
+   * 3. finally the configured `container`. Fails loud when every source is
+   *    absent or the path is shared by several containers rather than guessing
+   *    a container the path does not belong to.
    * @param spec - the resolved execution spec (its dshEnv carries the session fact).
-   * @param containerPath - the normalized container workdir.
-   * @returns the container name.
+   * @param containerPath - the normalized workdir (anchor host path or container path).
+   * @returns the container name plus the in-container working directory.
    */
-  private resolveContainer(spec: ShellExecSpec, containerPath: string): string {
+  private resolveContainer(spec: ShellExecSpec, containerPath: string): { container: string; containerPath: string } {
+    const anchor = resolveAnchorPath(containerPath)
+    if (anchor !== undefined) {
+      const root = containerPathOf(anchor.entry, anchor.anchor)
+      return {
+        container: anchor.entry.container,
+        containerPath: anchor.remainder === '' ? root : normalizeWindowsPath(`${root}\\${anchor.remainder}`),
+      }
+    }
     const fromEnv = spec.dshEnv?.DSH_DOCKER_CONTAINER
-    if (fromEnv !== undefined && fromEnv !== '') return fromEnv
+    if (fromEnv !== undefined && fromEnv !== '') return { container: fromEnv, containerPath }
     const fromStore = getWorkspace(containerPath)
-    if (fromStore !== undefined) return fromStore.container
+    if (fromStore !== undefined) return { container: fromStore.container, containerPath }
     const configured = this.config.container
-    if (configured !== undefined && configured !== '') return configured
+    if (configured !== undefined && configured !== '') return { container: configured, containerPath }
+    const owners = containerOwners(containerPath)
+    const detail = owners.length > 1
+      ? `; it is shared by containers ${owners.map(owner => owner.entry.container).join(', ')} — add each workspace again through the Docker workspace dialog so every container gets its own workspace`
+      : ''
     throw new Error(
-      'docker-shell: container path carries no container; no session DSH_DOCKER_CONTAINER, '
-      + 'workspace store entry, or container config is available',
+      `docker-shell: container path carries no container; no session DSH_DOCKER_CONTAINER, `
+      + `workspace store entry, or container config is available${detail}`,
     )
   }
 
@@ -251,21 +270,21 @@ export class DockerShellExecutor extends ShellExecutor {
       throw new Error(`docker-shell: workdir "${workdir}" is not a Windows container path`)
     }
     const containerPath = normalizeWindowsPath(workdir)
-    const container = this.resolveContainer(spec, containerPath)
+    const resolved = this.resolveContainer(spec, containerPath)
     // The `docker` process itself needs a plain Windows directory: its own cwd
     // is irrelevant (`-w` sets the container side). SystemRoot always exists.
     const hostCwd = process.env.SystemRoot ?? process.cwd()
     const argv = [
       this.config.dockerPath,
       'exec', '-i',
-      '-w', containerPath,
+      '-w', resolved.containerPath,
       ...this.envArgs(spec),
-      container,
+      resolved.container,
       this.config.shellPath,
       '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
       `${ENCODING_PREAMBLE}${spec.command}`,
     ]
-    return { container, containerPath, hostCwd, argv }
+    return { container: resolved.container, containerPath: resolved.containerPath, hostCwd, argv }
   }
 
   /** Map a plan onto a fully-specified subprocess spawn. */

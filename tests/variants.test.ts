@@ -49,6 +49,45 @@ describe('transformPresetForDocker', () => {
     expect(out).toContain('inside a Windows Docker container')
   })
 
+  it('appends to `prefix` when the persona uses the 0.1.5 split, leaving `suffix` alone', () => {
+    const modern = [
+      '- id: persona',
+      "  name: '@deepseek-ai/dsh-persona'",
+      '  config:',
+      '    suffix: Your working directory is {{cwd}}.',
+      '    prefix: >-',
+      '      You are a coding agent powered by the {{model}} model.',
+      '- id: tool-fs',
+      "  name: '@deepseek-ai/dsh-tool-fs'",
+    ].join('\n')
+    const lines = transformPresetForDocker(modern, SHELL, FS).split('\n')
+    const suffix = lines.findIndex(line => line.includes('suffix:'))
+    const prefix = lines.findIndex(line => /prefix: [>|-]/.test(line))
+    const appended = lines.findIndex(line => line.includes('inside a Windows Docker container'))
+    expect(lines[suffix]).toBe('    suffix: Your working directory is {{cwd}}.')
+    expect(suffix).toBeLessThan(prefix)
+    expect(appended).toBeGreaterThan(prefix)
+  })
+
+  it('ends the folded body at the next sibling key instead of splicing past it', () => {
+    const withTail = [
+      '- id: persona',
+      "  name: '@deepseek-ai/dsh-persona'",
+      '  config:',
+      '    prefix: >-',
+      '      You are an agent.',
+      '    includeRuntimeContext: false',
+      '- id: tool-fs',
+      "  name: '@deepseek-ai/dsh-tool-fs'",
+    ].join('\n')
+    const lines = transformPresetForDocker(withTail, SHELL, FS).split('\n')
+    const prose = lines.findIndex(line => line.includes('You are an agent.'))
+    const appended = lines.findIndex(line => line.includes('inside a Windows Docker container'))
+    const sibling = lines.findIndex(line => line.includes('includeRuntimeContext'))
+    expect(appended).toBeGreaterThan(prose)
+    expect(appended).toBeLessThan(sibling)
+  })
+
   it('keeps unknown top-level rows verbatim', () => {
     const withUnknown = '- id: custom-thing\n  name: x\n' + SOURCE
     const out = transformPresetForDocker(withUnknown, SHELL, FS)
